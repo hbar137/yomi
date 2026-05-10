@@ -107,6 +107,39 @@ def scp_to(host: str, port: int, src: Path, dst: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+def upload_files_compressed(host: str, port: int, src_dir: Path,
+                            names: list[str], remote_dir: str) -> None:
+    """Upload `names` from `src_dir` to `remote_dir` via tar+gzip+ssh pipe.
+
+    Single TCP connection; gzip -1 (fast) compresses jsonl-style data
+    ~3-5x in flight. Faster than scp on long-RTT links to RunPod
+    datacenters because:
+      - one connection has its TCP window grow to the full BDP rather
+        than scp re-negotiating per-file;
+      - the compressed bytes are smaller than the raw payload, so
+        whatever the bottleneck (BDP, ISP shaping, etc.) gates fewer
+        bytes on the wire.
+
+    Requires `gzip` + `tar` on both ends; both ship in the RunPod
+    pytorch template.
+    """
+    src_dir = Path(src_dir).resolve()
+    files = " ".join(shlex.quote(n) for n in names)
+    ssh_opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                "-o LogLevel=ERROR")
+    remote = (
+        f"mkdir -p {shlex.quote(str(remote_dir))} && "
+        f"cd {shlex.quote(str(remote_dir))} && "
+        f"gunzip | tar -xf -"
+    )
+    cmd = (
+        f"tar -cf - -C {shlex.quote(str(src_dir))} {files} "
+        f"| gzip -1 "
+        f"| ssh {ssh_opts} -p {port} root@{host} {shlex.quote(remote)}"
+    )
+    subprocess.run(cmd, shell=True, check=True)
+
+
 def scp_from(host: str, port: int, src: str, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -310,12 +343,13 @@ def main() -> None:
             print(f"\nsetup failed with rc={rc}", file=sys.stderr)
             sys.exit(rc)
 
-        print(f"\nstaging data...", file=sys.stderr)
-        for fname in ("heteronyms.json", "train.jsonl", "val.jsonl"):
-            src = args.data_dir / fname
-            print(f"  scp {src.name} ({src.stat().st_size // (1024*1024)} MB)...",
-                  file=sys.stderr)
-            scp_to(host, port, src, "/workspace/yomi/data/")
+        print(f"\nstaging data (tar+gzip pipe)...", file=sys.stderr)
+        names = ["heteronyms.json", "train.jsonl", "val.jsonl"]
+        total_mb = sum((args.data_dir / n).stat().st_size for n in names) // (1024*1024)
+        print(f"  uploading {len(names)} files, {total_mb} MB raw",
+              file=sys.stderr)
+        upload_files_compressed(host, port, args.data_dir, names,
+                                "/workspace/yomi/data")
 
         # Training command runs from /workspace/yomi so paths resolve to the
         # repo's data/ + models/ subdirs.
