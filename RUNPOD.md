@@ -63,29 +63,62 @@ notices. Secure cloud A40 / 4090 boots reliably.
 
 ### GPU choice
 
+`runpodctl gpu list` shows availability + stock but **not prices**. For
+prices, hit the GraphQL API directly. This one-liner prints a sorted
+secure/community comparison for training-grade GPUs:
+
 ```sh
-RUNPOD_API_KEY=$(cat ~/secrets/runpod/api_key.txt) runpodctl gpu list \
-  | python3 -c "
+curl -s -X POST https://api.runpod.io/graphql \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ gpuTypes { id displayName memoryInGb securePrice communityPrice } }"}' \
+| python3 -c "
 import json,sys
-for g in json.load(sys.stdin):
-    if g.get('secureCloud') and g.get('available'):
-        print(f\"{g['gpuId']:<35} {g['displayName']:<20} stock={g['stockStatus']}\")
+ts = json.load(sys.stdin)['data']['gpuTypes']
+keep = [t for t in ts if 'AMD' not in t['id'] and t['memoryInGb'] >= 16
+        and (t.get('securePrice') or t.get('communityPrice'))]
+keep.sort(key=lambda t: t.get('securePrice') or t.get('communityPrice') or 99)
+print(f\"{'GPU':<28} {'VRAM':>5} {'sec/hr':>8} {'comm/hr':>9}\")
+print('-' * 54)
+for t in keep:
+    s = t.get('securePrice') or 0
+    c = t.get('communityPrice') or 0
+    print(f\"{t['displayName'][:27]:<28} {str(t['memoryInGb'])+'G':>5} \"
+          f\"{f'\${s:.2f}' if s else '—':>8} {f'\${c:.2f}' if c else '—':>9}\")
 "
 ```
 
-For a typical 1B-param-or-smaller training job:
+#### Snapshot (2026-05-10, secure cloud unless noted)
 
-| GPU | VRAM | FP16 TFLOPS | Why pick |
-|---|---|---|---|
-| RTX 4090 | 24 GB | ~83 | best $/throughput, usually Medium stock |
-| A40 | 48 GB | ~37 | always High stock, ECC, sustained load |
-| A100 80 GB | 80 GB | ~312 | when you need capacity (big batches, big seq) |
+Picking the right tier matters more than picking the most powerful GPU.
 
-**Match GPU to workload, not to "what feels powerful"** — RTX 4090 beats
-A40 on every dimension except VRAM headroom. If 24 GB is enough, pay 4090.
+| Tier | GPU | VRAM | $/hr | When to pick |
+|---|---|---|---|---|
+| **Cheap small jobs** | RTX A5000 | 24 G | $0.27 | Fits ≤500M-param models, slow but cheap |
+| **Sweet spot** | **RTX 4090** | 24 G | **$0.69** | Best $/throughput for ≤1B-param training (~83 TFLOPS FP16) |
+| **VRAM headroom** | A40 | 48 G | $0.44 | Larger batch / longer seq when 24G is tight; ECC; sustained load |
+| **Big batches** | A100 80GB PCIe | 80 G | $1.39 | When batches need 40–60G activation memory |
+| **Frontier** | H100 SXM | 80 G | $2.99 | Multi-GPU training, FP8, big models |
+| **Avoid for small jobs** | B200/B300/H200 | 140G+ | $3.39+ | Overkill unless you actually need the VRAM/compute |
 
-`runpodctl gpu list` shows current `stockStatus`. If it's Low, expect
-"resource not available" errors at create time; pick something else.
+#### Quick decision matrix
+
+| Constraint | Pick |
+|---|---|
+| Single-GPU model fits in 24 GB at desired batch size | RTX 4090 (best perf/$ in this range) |
+| Need >24 GB VRAM, ≤48 GB | A40 (cheapest at 48G) |
+| Need >48 GB VRAM | A100 80GB PCIe (cheapest at 80G) |
+| Multi-GPU NVLink needed | H100 SXM or A100 SXM |
+| Hobby/idle VM, latency-tolerant | RTX A5000 community ($0.16/hr) |
+| Production batch job, must complete | secure cloud (any tier) |
+
+**Don't fall for "what feels powerful"** — H100/B200 are 4–8× the $/hr of
+4090 but only ~3× the FP16 throughput on small workloads. For ≤1B-param
+training, 4090 wins on $/throughput by a wide margin.
+
+Stock matters too: `runpodctl gpu list --include-unavailable` shows
+`stockStatus`. If it's Low, your `pod create` will likely fail with
+"resource not available"; pick the next-best tier.
 
 ---
 
