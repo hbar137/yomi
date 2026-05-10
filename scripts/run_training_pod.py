@@ -44,7 +44,7 @@ GPU_TYPES = {
     "RTX3090": "NVIDIA GeForce RTX 3090",
     "RTX4090": "NVIDIA GeForce RTX 4090",
     "A40":     "NVIDIA A40",
-    "A100":    "NVIDIA A100 80GB PCIe",
+    "A100":    "NVIDIA A100-SXM4-80GB",
 }
 
 
@@ -208,17 +208,17 @@ def main() -> None:
     create_args = [
         "pod", "create",
         "--name", pod_name,
-        "--imageName", args.image,
-        "--gpuType", GPU_TYPES[args.gpu],
-        "--gpuCount", "1",
-        "--containerDiskSize", str(args.container_disk),
-        "--volumeSize", str(args.volume_size),
-        "--volumePath", "/workspace",
-        "--cost", str(args.max_cost),
-        "--communityCloud",
-        "--startSSH",
+        "--image", args.image,
+        "--gpu-id", GPU_TYPES[args.gpu],
+        "--gpu-count", "1",
+        "--container-disk-in-gb", str(args.container_disk),
+        "--volume-in-gb", str(args.volume_size),
+        "--volume-mount-path", "/workspace",
+        "--cloud-type", "COMMUNITY",
+        "--ssh",
         "--ports", "22/tcp",
-        "--args", "sleep infinity",  # idle; orchestrator runs training over SSH
+        # No --args / --entrypoint flag: image's ENTRYPOINT=sleep infinity
+        # keeps the pod idle so we can SSH in.
     ]
     pod = runpodctl(*create_args)
     pod_id = pod["id"] if isinstance(pod, dict) else None

@@ -35,14 +35,14 @@ RUN python -c "from transformers import AutoModel, AutoTokenizer; \
 # checkpoints) — caller mounts both at runtime.
 WORKDIR /workspace
 
-# Entrypoint is `bash -c` so the orchestrator can pass either the training
-# command or `sleep infinity` (RunPod doesn't expose --entrypoint at pod
-# create time, only --args / docker CMD). Default args run Path 1 training
-# assuming /workspace/data is already staged.
-#   Local docker run:
+# Entrypoint sleeps so the orchestrator can SSH in to upload data and run
+# training on its own schedule. RunPod's runpodctl doesn't expose an
+# --entrypoint or --args override at pod create time, so we hardcode
+# `sleep infinity` here and drive everything via SSH.
+#   Local docker run for ad-hoc training:
 #     docker run --gpus all -v $PWD/data:/workspace/data \
 #                           -v $PWD/models:/workspace/models \
+#                           --entrypoint python \
 #                           ghcr.io/hbar137/yomi-train:latest \
-#                           "python -m yomi.train --epochs 5 --batch-size 64"
-ENTRYPOINT ["bash", "-c"]
-CMD ["python -m yomi.train --data-dir /workspace/data --heteronyms /workspace/data/heteronyms.json --out-dir /workspace/models --run-name v1"]
+#                           -m yomi.train --epochs 3 --run-name v1
+ENTRYPOINT ["sleep", "infinity"]
