@@ -120,36 +120,49 @@ def scp_from(host: str, port: int, src: str, dst: Path) -> None:
 
 
 def wait_for_ssh(pod_id: str, timeout: int = 1200) -> tuple[str, int]:
-    """Poll pod status until SSH is reachable. Returns (host, port).
+    """Poll pod status until SSH actually responds. Returns (host, port).
 
-    runpodctl reports SSH reachability via `info["ssh"]["ip"]/[port]` once
-    the host has been allocated, but the container itself only starts
-    after the image has been pulled (uptimeSeconds > 0). We need both:
-    SSH info present AND container running.
+    `runpodctl pod get` reports SSH host/port quickly, but its
+    `uptimeSeconds` lags far behind the container's real readiness — on
+    secure-cloud A40 we observed `uptime=0` for 5+ min after sshd was
+    already accepting connections. So we test SSH directly with a short
+    probe and consider the pod ready as soon as a one-shot `echo` works.
     """
     deadline = time.time() + timeout
-    last_msg = ""
+    host = port = None
     while time.time() < deadline:
         info = runpodctl("pod", "get", pod_id)
         if isinstance(info, dict):
-            status = info.get("desiredStatus", "?")
-            uptime = info.get("uptimeSeconds", 0) or 0
             ssh = info.get("ssh") or {}
-            ip = ssh.get("ip")
-            port = ssh.get("port")
-            msg = f"  status={status} uptime={uptime}s ssh={ip}:{port}"
-            if msg != last_msg:
-                print(msg, file=sys.stderr)
-                last_msg = msg
-            if ip and port and uptime > 0:
-                return ip, int(port)
-        time.sleep(15)
+            host = ssh.get("ip") or host
+            port = ssh.get("port") or port
+            if host and port:
+                rc = subprocess.run(
+                    ["ssh", "-p", str(port),
+                     "-o", "StrictHostKeyChecking=no",
+                     "-o", "UserKnownHostsFile=/dev/null",
+                     "-o", "LogLevel=ERROR",
+                     "-o", "ConnectTimeout=8",
+                     f"root@{host}", "true"],
+                    capture_output=True,
+                ).returncode
+                if rc == 0:
+                    return host, int(port)
+                print(f"  ssh {host}:{port} not yet responding...", file=sys.stderr)
+            else:
+                print(f"  pod status={info.get('desiredStatus','?')}, no ssh info yet",
+                      file=sys.stderr)
+        time.sleep(10)
     sys.exit(f"timed out after {timeout}s; check `runpodctl pod get {pod_id}` manually")
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gpu", choices=GPU_TYPES.keys(), default="RTX3090")
+    ap.add_argument("--gpu", choices=GPU_TYPES.keys(), default="A40")
+    ap.add_argument("--cloud-type", choices=("SECURE", "COMMUNITY"), default="SECURE",
+                    help="SECURE is more reliable; COMMUNITY is cheaper but "
+                         "workers are often being decommissioned/replaced "
+                         "(observed pull stalls of 18+ min on community)")
     ap.add_argument("--max-cost", type=float, default=0.30,
                     help="$/hr ceiling; pod fails to create if no GPU available below this")
     ap.add_argument("--container-disk", type=int, default=20, help="GB")
@@ -235,8 +248,7 @@ def main() -> None:
         "--container-disk-in-gb", str(args.container_disk),
         "--volume-in-gb", str(args.volume_size),
         "--volume-mount-path", "/workspace",
-        "--cloud-type", "COMMUNITY",
-        "--public-ip",   # community cloud: required for SSH to be reachable
+        "--cloud-type", args.cloud_type,
         "--ssh",
         "--ports", "22/tcp",
     ]

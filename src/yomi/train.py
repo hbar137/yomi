@@ -131,20 +131,27 @@ class HeteronymDataset(Dataset):
         e = self.examples[idx]
         enc = self.tokenizer(
             e.sentence,
-            return_offsets_mapping=True,
             truncation=True,
             max_length=self.max_length,
             return_tensors=None,
         )
-        # Map char span -> token span using offset mappings.
+        # cl-tohoku/bert-base-japanese-char-v3 is strictly character-level
+        # (1 input char -> 1 token, [UNK] for unrepresentable chars). The
+        # tokenizer is the slow Python implementation, which doesn't expose
+        # return_offsets_mapping. We compute offsets manually: token at
+        # index i corresponds to char at position (i - n_leading_special).
+        # In practice [CLS] is the only leading special token.
+        n_special_leading = 1  # [CLS]
         token_start = token_end = None
-        for i, (lo, hi) in enumerate(enc["offset_mapping"]):
-            if lo == hi == 0:
-                continue  # special tokens
-            if token_start is None and lo <= e.span_start < hi:
+        n_tokens = len(enc["input_ids"])
+        # Iterate non-special tokens (skip [CLS] at 0 and [SEP] at end).
+        for i in range(n_special_leading, n_tokens - 1):
+            char_pos = i - n_special_leading
+            if token_start is None and char_pos == e.span_start:
                 token_start = i
-            if lo < e.span_end <= hi:
+            if char_pos + 1 == e.span_end:
                 token_end = i + 1
+                break
         if token_start is None or token_end is None or token_end <= token_start:
             # Span got truncated out; fallback to first non-special token so
             # the batch shape stays valid. We mask these via `valid_mask` so
