@@ -335,10 +335,23 @@ def main() -> None:
             sys.exit(rc)
 
         print(f"\npulling checkpoint...", file=sys.stderr)
-        scp_from(host, port,
-                 f"/workspace/yomi/models/{args.run_name}/best",
-                 args.out_dir / args.run_name / "best")
-        print(f"  -> {args.out_dir / args.run_name / 'best'}", file=sys.stderr)
+        # Try `best` first (saved on val-acc improvement); fall back to
+        # `last` (always saved at end of training) for short smoke runs
+        # that don't reach an eval cycle.
+        pulled = False
+        for kind in ("best", "last"):
+            remote = f"/workspace/yomi/models/{args.run_name}/{kind}"
+            local = args.out_dir / args.run_name / kind
+            check = ssh_exec(host, port, f"test -d {shlex.quote(remote)}")
+            if check != 0:
+                continue
+            scp_from(host, port, remote, local)
+            print(f"  pulled {kind} -> {local}", file=sys.stderr)
+            pulled = True
+            break
+        if not pulled:
+            print("  no checkpoint dir found on pod (no val cycle ran?)",
+                  file=sys.stderr)
 
     finally:
         cleanup()
