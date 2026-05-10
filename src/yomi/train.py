@@ -54,6 +54,13 @@ class Example:
     reading: str
     work_id: str
     source: str
+    # Pre-tokenized at scripts/04_build_examples.py time; if missing, the
+    # dataset falls back to tokenizing on the fly (slow). All examples
+    # produced by the current 04 script include these fields.
+    input_ids: list[int] | None = None
+    token_start: int | None = None
+    token_end: int | None = None
+    valid: bool | None = None
 
 
 def load_jsonl(path: Path) -> list[Example]:
@@ -69,6 +76,10 @@ def load_jsonl(path: Path) -> list[Example]:
                 reading=d["reading"],
                 work_id=d["work_id"],
                 source=d.get("source", "unknown"),
+                input_ids=d.get("input_ids"),
+                token_start=d.get("token_start"),
+                token_end=d.get("token_end"),
+                valid=d.get("valid"),
             ))
     return out
 
@@ -106,9 +117,17 @@ class HeteronymTable:
 # --- dataset / collator -----------------------------------------------------
 
 class HeteronymDataset(Dataset):
-    """Lazy-tokenized dataset. We tokenize on-the-fly so we keep the
-    tokenizer in only one place; for ~1M examples each ~50 chars long the
-    tokenizer overhead is small relative to the BERT forward pass."""
+    """Reads pre-tokenized examples produced by scripts/04_build_examples.py.
+
+    Each example arrives with input_ids + token_start/token_end + valid
+    already computed, so __getitem__ is just a tensor cast. Tokenizing was
+    the dataloader bottleneck; pre-computing here moves it out of the
+    train hot path entirely.
+
+    `tokenizer` arg is kept for backwards compat (and to derive pad_token_id
+    in collate); not used here. If pre-tokenized fields are missing on a
+    given example we raise — re-run scripts/04 to regenerate.
+    """
 
     def __init__(self, examples: list[Example], tokenizer, hetero: HeteronymTable,
                  max_length: int = 128):
@@ -120,54 +139,27 @@ class HeteronymDataset(Dataset):
         if dropped:
             print(f"  dropped {dropped} examples whose surface/reading "
                   f"isn't in the heteronym table", file=sys.stderr)
-        self.tokenizer = tokenizer
         self.hetero = hetero
         self.max_length = max_length
+        # Sanity-check: pre-tokenized fields must be present.
+        if self.examples and self.examples[0].input_ids is None:
+            raise RuntimeError(
+                "examples are not pre-tokenized — re-run scripts/04_build_examples.py "
+                "to regenerate jsonls with input_ids/token_start/token_end/valid"
+            )
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> dict:
         e = self.examples[idx]
-        enc = self.tokenizer(
-            e.sentence,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=None,
-        )
-        # cl-tohoku/bert-base-japanese-char-v3 is strictly character-level
-        # (1 input char -> 1 token, [UNK] for unrepresentable chars). The
-        # tokenizer is the slow Python implementation, which doesn't expose
-        # return_offsets_mapping. We compute offsets manually: token at
-        # index i corresponds to char at position (i - n_leading_special).
-        # In practice [CLS] is the only leading special token.
-        n_special_leading = 1  # [CLS]
-        token_start = token_end = None
-        n_tokens = len(enc["input_ids"])
-        # Iterate non-special tokens (skip [CLS] at 0 and [SEP] at end).
-        for i in range(n_special_leading, n_tokens - 1):
-            char_pos = i - n_special_leading
-            if token_start is None and char_pos == e.span_start:
-                token_start = i
-            if char_pos + 1 == e.span_end:
-                token_end = i + 1
-                break
-        if token_start is None or token_end is None or token_end <= token_start:
-            # Span got truncated out; fallback to first non-special token so
-            # the batch shape stays valid. We mask these via `valid_mask` so
-            # they don't contribute to loss.
-            valid = False
-            token_start, token_end = 1, 2
-        else:
-            valid = True
         return {
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "token_start": token_start,
-            "token_end": token_end,
+            "input_ids": e.input_ids,
+            "token_start": e.token_start,
+            "token_end": e.token_end,
             "surface": e.surface,
             "label": self.hetero.reading_index(e.surface, e.reading),
-            "valid": valid,
+            "valid": e.valid,
         }
 
 
@@ -178,7 +170,7 @@ def collate(batch: list[dict], pad_token_id: int) -> dict:
     for i, b in enumerate(batch):
         L = len(b["input_ids"])
         input_ids[i, :L] = torch.tensor(b["input_ids"], dtype=torch.long)
-        attn[i, :L] = torch.tensor(b["attention_mask"], dtype=torch.long)
+        attn[i, :L] = 1  # 1 for real tokens, 0 for the trailing pad
     return {
         "input_ids": input_ids,
         "attention_mask": attn,
