@@ -222,28 +222,60 @@ class YomiBert(nn.Module):
     ) -> dict:
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         h = out.last_hidden_state  # (B, L, H)
+        B, L, _ = h.shape
+        device = h.device
 
-        # Pool span hidden states. Mean over tokens in [start, end). We loop
-        # per-example because spans differ; for typical batch sizes (~32) this
-        # is negligible vs the BERT forward.
-        B = h.size(0)
-        losses = []
-        preds = []
-        for i in range(B):
-            s, e = token_starts[i].item(), token_ends[i].item()
-            pooled = h[i, s:e].mean(dim=0)  # (H,)
-            logits = self.heads[safe_key(surfaces[i])](pooled)  # (n_readings,)
-            preds.append(int(logits.argmax(dim=0).item()))
-            if labels is not None and (valid is None or bool(valid[i].item())):
-                losses.append(F.cross_entropy(logits.unsqueeze(0),
-                                              labels[i:i + 1]))
+        # Vectorized span pooling: mean of h[i, token_starts[i]:token_ends[i]]
+        # without any .item() syncs. Builds a per-example boolean mask.
+        positions = torch.arange(L, device=device).unsqueeze(0)  # (1, L)
+        span_mask = ((positions >= token_starts.unsqueeze(1)) &
+                     (positions < token_ends.unsqueeze(1))).to(h.dtype)  # (B, L)
+        span_count = span_mask.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
+        pooled = (h * span_mask.unsqueeze(-1)).sum(dim=1) / span_count   # (B, H)
 
-        result: dict = {"preds": preds}
-        if losses:
-            result["loss"] = torch.stack(losses).mean()
-        else:
-            result["loss"] = h.new_zeros(())
-        return result
+        # Group examples in this batch by surface. Each surface routes through
+        # its own classification head; grouping turns B per-example matmuls
+        # into ~unique-surfaces-per-batch matmuls (typically 10–20× fewer
+        # ops, eliminating the GPU-sync stall pattern from the per-example
+        # .item() loop).
+        surface_to_idxs: dict[str, list[int]] = {}
+        for i, s in enumerate(surfaces):
+            surface_to_idxs.setdefault(s, []).append(i)
+
+        if labels is not None:
+            # Train mode: produce a single scalar loss; skip prediction
+            # collection entirely (preds aren't used during training).
+            loss_terms: list[torch.Tensor] = []
+            n_valid = torch.zeros((), device=device)
+            for surf, py_idxs in surface_to_idxs.items():
+                idxs = torch.tensor(py_idxs, device=device, dtype=torch.long)
+                sub_pooled = pooled.index_select(0, idxs)
+                sub_logits = self.heads[safe_key(surf)](sub_pooled)
+                sub_labels = labels.index_select(0, idxs)
+                ce = F.cross_entropy(sub_logits, sub_labels, reduction="none")
+                if valid is not None:
+                    sub_valid = valid[py_idxs].to(device=device, dtype=h.dtype)
+                    loss_terms.append((ce * sub_valid).sum())
+                    n_valid = n_valid + sub_valid.sum()
+                else:
+                    loss_terms.append(ce.sum())
+                    n_valid = n_valid + ce.numel()
+            if loss_terms:
+                loss = torch.stack(loss_terms).sum() / n_valid.clamp_min(1)
+            else:
+                loss = h.new_zeros(())
+            return {"loss": loss, "preds": []}
+
+        # Eval mode: compute preds, no loss.
+        preds = [0] * B
+        for surf, py_idxs in surface_to_idxs.items():
+            idxs = torch.tensor(py_idxs, device=device, dtype=torch.long)
+            sub_pooled = pooled.index_select(0, idxs)
+            sub_logits = self.heads[safe_key(surf)](sub_pooled)
+            sub_preds = sub_logits.argmax(dim=1).tolist()
+            for j, idx in enumerate(py_idxs):
+                preds[idx] = sub_preds[j]
+        return {"loss": h.new_zeros(()), "preds": preds}
 
 
 # --- training loop ----------------------------------------------------------
