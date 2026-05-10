@@ -185,6 +185,14 @@ def main() -> None:
                     default=Path("data/raw/wikipedia.xml.bz2"))
     ap.add_argument("--out", type=Path,
                     default=Path("data/wikipedia_names.json"))
+    ap.add_argument("--heteronyms", type=Path,
+                    default=Path("data/heteronyms.json"),
+                    help="cross-ref to drop wiki entries whose reading "
+                         "disagrees with a known multi-reading common word")
+    ap.add_argument("--jmdict", type=Path,
+                    default=Path("data/jmdict_readings.json"),
+                    help="cross-ref to drop wiki entries whose reading "
+                         "disagrees with a JMdict common-word reading")
     ap.add_argument("--limit-pages", type=int, default=0,
                     help="for smoke tests; 0 = all")
     args = ap.parse_args()
@@ -194,12 +202,35 @@ def main() -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
+    # Cross-reference dictionaries — used to drop wiki entries that collide
+    # with common-word readings. A Wikipedia article titled "一日" about a
+    # person named かずてる would otherwise poison every common-word use of
+    # 一日 (いちにち / ついたち / ...).
+    heteronym_readings: dict[str, set[str]] = {}
+    if args.heteronyms.exists():
+        for s, table in json.load(args.heteronyms.open(encoding="utf-8")).items():
+            heteronym_readings[s] = set(table.keys())
+    jmdict_readings: dict[str, set[str]] = {}
+    if args.jmdict.exists():
+        for s, readings in json.load(args.jmdict.open(encoding="utf-8")).items():
+            if isinstance(readings, list):
+                jmdict_readings[s] = set(readings)
+
+    def is_collision(surface: str, reading: str) -> bool:
+        """True if surface is a known common word and reading disagrees."""
+        if surface in heteronym_readings:
+            return reading not in heteronym_readings[surface]
+        if surface in jmdict_readings:
+            return reading not in jmdict_readings[surface]
+        return False
+
     # Conflict resolution: for each surface, keep the first reading we see
     # but track conflicts so we can report them. A surface mapping to two
     # different readings across two articles is a real ambiguity (homograph
     # entities — different people named 中田).
     chosen: dict[str, str] = {}
     conflict_count: dict[str, int] = {}
+    n_dropped_collision = 0
 
     n_pages = n_with_opener = n_entries = 0
 
@@ -228,6 +259,9 @@ def main() -> None:
                 n_with_opener += 1
                 surface, reading = opener
                 for s, r in emit_entries(surface, reading).items():
+                    if is_collision(s, r):
+                        n_dropped_collision += 1
+                        continue
                     if s not in chosen:
                         chosen[s] = r
                         n_entries += 1
@@ -249,6 +283,8 @@ def main() -> None:
     print(f"with parseable opener: {n_with_opener}", file=sys.stderr)
     print(f"unique surfaces written: {len(chosen)}", file=sys.stderr)
     print(f"surfaces with conflicting readings (first kept): {len(conflict_count)}",
+          file=sys.stderr)
+    print(f"entries dropped by heteronym/JMdict collision filter: {n_dropped_collision:,}",
           file=sys.stderr)
     print(f"-> {args.out}", file=sys.stderr)
 
