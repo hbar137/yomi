@@ -332,6 +332,85 @@ returns. Always have the orchestrator delete the pod in a `try/finally`,
 even on Ctrl-C / errors. Always check `runpodctl pod list` after a
 session for stragglers.
 
+### Trap 9 — Tokenize at dataset-build time, not in the dataloader
+
+**Symptom**: training is GPU-bound on paper (small model, fast GPU) but
+GPU utilization sits at 40-50%, low CPU too, throughput far below what
+the GPU should deliver.
+
+**Why**: a slow Python tokenizer (e.g. cl-tohoku BertJapaneseTokenizer,
+which has no fast Rust variant) running inside the DataLoader workers
+can't supply data fast enough. With `num_workers=8` you're limited to
+roughly `8 × tokenizer_throughput_per_thread`, and that's often less
+than the GPU can consume. Increasing `num_workers` past ~8 has rapidly
+diminishing returns on fork overhead.
+
+Symptom often masquerades as "low GPU util means GPU sync stall" — but
+when you check CPU and it's also low, the workers are waiting on GIL or
+process-level overhead, not the GPU.
+
+**Fix**: tokenize once at dataset-build time. Store `input_ids` (and
+char-offset → token-index mapping if you need it for span tasks) in
+the jsonl/parquet alongside `sentence` and labels. `__getitem__` becomes
+a dict lookup instead of a tokenizer call.
+
+Cost: jsonl size grows ~2× (input_ids per row); training-time CPU drops
+from "thousands of tokenizer calls per second" to "thousands of dict
+lookups per second." On the yomi 814k-example training set this took
+training from 11 step/s to 16 step/s on RTX 4090 (+45%) and pushed GPU
+util from ~48% to higher (untested ceiling). Apply this whenever your
+training script imports a tokenizer.
+
+The host-side tokenization (writing pre-tokenized jsonl) ran at ~9k
+examples/sec on a single thread — way above what the dataloader's
+8 workers were achieving (~400 ex/s). It's not slow tokenization, it's
+multiprocess overhead in the dataloader path.
+
+### Trap 10 — Default scp is slow on long-RTT links; pipe through tar+gzip
+
+**Symptom**: home upload speed-tests at 90 MB/s, pod download speed-tests
+at 70 MB/s, but `scp` between them sustains 1-5 MB/s. Uploading a 500 MB
+training dataset takes 10+ min instead of seconds.
+
+**Why**: scp uses a single TCP connection with limited application-layer
+buffering. Over high-RTT links (~80-120 ms to RunPod datacenters) the
+TCP window doesn't fill the bandwidth-delay-product unless the kernel
+auto-tunes aggressively. The legacy SCP protocol also adds per-file
+metadata round-trips. Net result: throughput far below either endpoint's
+capability.
+
+**Fix**: use a single tar+gzip pipeline through one ssh connection.
+
+```python
+# Replaces multiple scp <file> calls.
+import shlex, subprocess
+def upload_files_compressed(host, port, src_dir, names, remote_dir):
+    files = " ".join(shlex.quote(n) for n in names)
+    ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    remote = (f"mkdir -p {shlex.quote(remote_dir)} && "
+              f"cd {shlex.quote(remote_dir)} && gunzip | tar -xf -")
+    cmd = (f"tar -cf - -C {shlex.quote(str(src_dir))} {files} "
+           f"| gzip -1 "
+           f"| ssh {ssh_opts} -p {port} root@{host} {shlex.quote(remote)}")
+    subprocess.run(cmd, shell=True, check=True)
+```
+
+Three things going right at once:
+- **One TCP connection** lets the window scale to full BDP rather than
+  scp re-negotiating per file.
+- **gzip -1** compresses jsonl 3-5× (repeated field names compress well);
+  fewer wire bytes regardless of bottleneck.
+- **No SCP per-file overhead** — tar streams everything as one blob.
+
+`gzip` and `tar` ship with the RunPod pytorch template; no extra deps.
+
+If you need partial / resumable uploads, use `rsync -avz --progress`
+instead — same compression idea but with delta encoding and resume.
+
+For inbound (pulling checkpoints from pod), the same pattern works
+inverted: ssh into pod, tar+gzip there, untar locally. For small
+artifacts (~50 MB) plain scp is fine; switch to tar+gzip for >100 MB.
+
 ---
 
 ## 6. Manual recovery
