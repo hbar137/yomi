@@ -1,0 +1,73 @@
+name: build-train-image
+
+# Builds Dockerfile.train and pushes to ghcr.io/<owner>/yomi-train.
+# Triggered on pushes to main, tag pushes (v*), or manual dispatch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.train'
+      - 'pyproject.toml'
+      - 'src/**'
+      - '.github/workflows/build-train.yml'
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Force the image name to <owner>/yomi-train regardless of repo name,
+  # so it stays at ghcr.io/hbar137/yomi-train even if the repo is renamed.
+  IMAGE: ${{ github.repository_owner }}/yomi-train
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The training image is ~14 GB uncompressed (cuda + torch + cached
+      # BERT). GitHub's runners have ~14 GB free disk after default
+      # toolchains; reclaim a few GB by dropping things we don't need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -a -f
+          df -h
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.train
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

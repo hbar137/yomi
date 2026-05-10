@@ -1,0 +1,48 @@
+# Source control & editor
+.git
+.gitignore
+.dockerignore
+.vscode
+.idea
+*.swp
+
+# Build output
+dist
+build
+out
+*.log
+
+# Node
+node_modules
+npm-debug.log
+
+# Python
+__pycache__
+*.pyc
+.venv
+venv
+
+# Go
+vendor
+
+# Stateful data — must NEVER ship in the image
+data
+# ...except the small runtime artifacts the pipeline needs at startup.
+# Whitelist them explicitly; everything else under data/ (parquets, raw/,
+# scratch outputs) stays excluded.
+!data/heteronyms.json
+!data/wikipedia_names.json
+!data/names.csv
+!data/compounds.csv
+
+# Secrets — must NEVER ship in the image
+.env
+.env.*
+secrets
+*.key
+*.pem
+
+# Docs (keep image lean — comment out if you want them in the image)
+*.md
+DEPLOY.md
+CLAUDE.md

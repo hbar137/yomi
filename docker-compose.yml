@@ -1,0 +1,25 @@
+services:
+  yomi:
+    build: .
+    image: yomi
+    container_name: yomi
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3047:8080"
+    volumes:
+      - ${HOME}/secrets:/secrets:ro
+    environment:
+      - TZ=America/Chicago
+    mem_limit: 8192m
+    cpus: 6.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

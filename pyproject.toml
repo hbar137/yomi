@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yomi"
+version = "0.1.0"
+description = "Hybrid MeCab + small-BERT pipeline for Japanese furigana / yomi generation."
+requires-python = ">=3.11"
+dependencies = [
+    # Inference / serving
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "fugashi>=1.4",
+    "unidic-lite>=1.0.8",
+    "onnxruntime>=1.19",
+    "pyarrow>=17",
+    "pydantic>=2.8",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.4",
+    "transformers>=4.45,<4.50",  # torch 2.4 in the train image trips on custom-op type annotations introduced in 4.50+
+    "datasets>=3.0",
+    "accelerate>=0.34",
+    "wandb>=0.18",
+    "scikit-learn>=1.5",
+    "tqdm>=4.66",
+]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

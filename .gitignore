@@ -1,0 +1,35 @@
+# Data and model artifacts (regenerable, large)
+data/
+models/
+*.onnx
+*.pt
+*.bin
+*.safetensors
+*.parquet
+*.tar
+*.tar.gz
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local state
+.claude/
+
+# OS
+.DS_Store

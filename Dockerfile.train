@@ -1,0 +1,48 @@
+# Training image for the yomi project.
+#
+# Built separately from the inference Dockerfile so the runtime image stays
+# small (no torch/transformers, no CUDA). This image is what we push to
+# ghcr.io and pull on RunPod for actual training runs.
+#
+# Data is mounted as a volume at /workspace/data — NOT baked in. That keeps
+# the image at ~5 GB (cuda+torch already do most of that), lets us re-run
+# with new data without rebuilding, and avoids shipping the corpus to a
+# public registry.
+
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+# CUDA image already has python + torch. Install the training extras.
+WORKDIR /app
+COPY pyproject.toml ./
+COPY src ./src
+
+# `.[train]` pulls torch/transformers/accelerate/wandb/tqdm/scikit-learn.
+# Torch is already in the base image; pip detects and skips. We use the
+# base image's torch deliberately because it's the version paired with
+# the cuDNN/CUDA stack — overriding via pip risks ABI mismatches.
+RUN pip install --no-cache-dir '.[train]'
+
+# Pre-download the base BERT weights so each RunPod instance doesn't have
+# to fetch ~400 MB on every run. The HuggingFace cache lives at
+# /root/.cache/huggingface by default.
+RUN python -c "from transformers import AutoModel, AutoTokenizer; \
+    name='cl-tohoku/bert-base-japanese-char-v3'; \
+    AutoModel.from_pretrained(name); \
+    AutoTokenizer.from_pretrained(name)"
+
+# RunPod convention: /workspace is the persistent volume mount point. We
+# expose /workspace/data (training inputs) and /workspace/models (output
+# checkpoints) — caller mounts both at runtime.
+WORKDIR /workspace
+
+# Default invocation runs Path 1 training. Override to invoke train_seq2seq
+# (Path 2, when written) or pass extra hyperparameter flags.
+#   docker run --gpus all -v $PWD/data:/workspace/data \
+#                         -v $PWD/models:/workspace/models \
+#                         ghcr.io/<user>/yomi-train:latest \
+#                         --epochs 5 --batch-size 64
+ENTRYPOINT ["python", "-m", "yomi.train"]
+CMD ["--data-dir", "/workspace/data", \
+     "--heteronyms", "/workspace/data/heteronyms.json", \
+     "--out-dir", "/workspace/models", \
+     "--run-name", "v1"]
