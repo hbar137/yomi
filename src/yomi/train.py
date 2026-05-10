@@ -308,11 +308,45 @@ def main() -> None:
     ap.add_argument("--eval-every-frac", type=float, default=0.5,
                     help="run val every X fraction of an epoch (0 = only at end)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-steps", type=int, default=0,
+                    help="cap total training steps (0 = no cap). Useful for "
+                         "CPU smoke tests: --max-steps 20 verifies the data "
+                         "loader, model build, and checkpoint write in ~1 min.")
+    ap.add_argument("--wandb", action="store_true",
+                    help="log to Weights & Biases. Requires WANDB_API_KEY in env.")
+    ap.add_argument("--wandb-project", default="yomi")
+    ap.add_argument("--eval-only", type=Path, default=None,
+                    help="path to a checkpoint dir (e.g. models/v1/best) to "
+                         "load and evaluate, then exit. Skips training.")
+    ap.add_argument("--eval-set", choices=("val", "test"), default="val",
+                    help="which split to use under --eval-only (default val)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}", file=sys.stderr)
+
+    # ---- eval-only short-circuit ------------------------------------------
+    if args.eval_only is not None:
+        ckpt = args.eval_only
+        hetero = HeteronymTable.load(ckpt / "heteronyms.json")
+        tokenizer = AutoTokenizer.from_pretrained(str(ckpt / "bert"), use_fast=True)
+        pad_id = tokenizer.pad_token_id
+        eval_path = args.data_dir / f"{args.eval_set}.jsonl"
+        eval_examples = load_jsonl(eval_path)
+        eval_ds = HeteronymDataset(eval_examples, tokenizer, hetero, args.max_length)
+        eval_dl = DataLoader(
+            eval_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+            collate_fn=lambda b: collate(b, pad_id),
+        )
+        model = YomiBert(str(ckpt / "bert"), hetero).to(device)
+        model.heads.load_state_dict(torch.load(ckpt / "heads.pt", map_location=device))
+        metrics = evaluate(model, eval_dl, device, hetero)
+        print(f"\n[{args.eval_set} on {ckpt}] micro={metrics['micro_acc']:.4f} "
+              f"macro={metrics['macro_acc']:.4f} n={metrics['n']}",
+              file=sys.stderr)
+        return
 
     hetero = HeteronymTable.load(args.heteronyms)
     print(f"heteronyms: {len(hetero.surfaces())} surfaces", file=sys.stderr)
@@ -341,6 +375,8 @@ def main() -> None:
     model = YomiBert(args.base_model, hetero).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
     total_steps = len(train_dl) * args.epochs
+    if args.max_steps and args.max_steps < total_steps:
+        total_steps = args.max_steps
     scheduler = get_linear_schedule_with_warmup(
         optim, num_warmup_steps=int(total_steps * args.warmup_pct),
         num_training_steps=total_steps,
@@ -351,6 +387,16 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     best_val = -1.0
     eval_every = max(int(len(train_dl) * args.eval_every_frac), 1) if args.eval_every_frac > 0 else 0
+
+    wandb_run = None
+    if args.wandb:
+        import wandb  # local import — only needed when flag is set
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.run_name,
+            config={k: str(v) if isinstance(v, Path) else v
+                    for k, v in vars(args).items()},
+        )
 
     step = 0
     t0 = time.time()
@@ -388,12 +434,20 @@ def main() -> None:
                 print(f"[ep{epoch} step {step}/{total_steps}] loss={avg:.4f} "
                       f"lr={scheduler.get_last_lr()[0]:.2e} "
                       f"{rate:.1f}st/s eta={eta_sec/60:.1f}m", file=sys.stderr)
+                if wandb_run is not None:
+                    wandb_run.log({"train/loss": avg,
+                                   "train/lr": scheduler.get_last_lr()[0],
+                                   "train/step": step})
 
             if eval_every and step % eval_every == 0:
                 metrics = evaluate(model, val_dl, device, hetero)
                 print(f"  [val @ step {step}] micro={metrics['micro_acc']:.4f} "
                       f"macro={metrics['macro_acc']:.4f} n={metrics['n']}",
                       file=sys.stderr)
+                if wandb_run is not None:
+                    wandb_run.log({"val/micro_acc": metrics["micro_acc"],
+                                   "val/macro_acc": metrics["macro_acc"],
+                                   "val/step": step})
                 if metrics["macro_acc"] > best_val:
                     best_val = metrics["macro_acc"]
                     save_checkpoint(model, tokenizer, args.heteronyms,
@@ -401,17 +455,31 @@ def main() -> None:
                     print(f"  saved best -> {run_dir / 'best'}", file=sys.stderr)
                 model.train()
 
+            if args.max_steps and step >= args.max_steps:
+                break  # exit inner batch loop
+
+        # If max_steps cap was hit, also break the epoch loop.
+        if args.max_steps and step >= args.max_steps:
+            break
+
         # End-of-epoch eval.
         metrics = evaluate(model, val_dl, device, hetero)
         print(f"== epoch {epoch} val: micro={metrics['micro_acc']:.4f} "
               f"macro={metrics['macro_acc']:.4f} n={metrics['n']} ==",
               file=sys.stderr)
+        if wandb_run is not None:
+            wandb_run.log({"val/micro_acc": metrics["micro_acc"],
+                           "val/macro_acc": metrics["macro_acc"],
+                           "val/epoch": epoch})
         if metrics["macro_acc"] > best_val:
             best_val = metrics["macro_acc"]
             save_checkpoint(model, tokenizer, args.heteronyms, run_dir / "best")
 
     save_checkpoint(model, tokenizer, args.heteronyms, run_dir / "last")
     print(f"\ndone. best val macro acc: {best_val:.4f}", file=sys.stderr)
+    if wandb_run is not None:
+        wandb_run.summary["best_val_macro_acc"] = best_val
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
