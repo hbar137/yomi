@@ -1,28 +1,34 @@
 """Orchestrate a single training run on RunPod via runpodctl.
 
 End-to-end:
-    1. Create an RTX 3090 spot pod with our training image, idle (`sleep infinity`).
-    2. Wait for SSH to be ready.
-    3. Stage data: scp data/heteronyms.json + train.jsonl + val.jsonl onto the pod.
-    4. Run training over SSH, streaming stdout to this terminal.
-    5. scp models/<run-name>/best/ back home.
-    6. Delete the pod.
+    1. Create an RTX 3090 spot pod from RunPod's PyTorch 2.4 template
+       (~1 min boot — cached on their workers, vs ~20 min for our 14 GB
+       custom image which RunPod doesn't cache).
+    2. Wait for SSH.
+    3. On the pod: git clone https://github.com/hbar137/yomi.git +
+       `pip install -e '.[train]'`. Idempotent — re-running on a pod with
+       persistent volume just `git pull`s.
+    4. scp data/heteronyms.json + train.jsonl + val.jsonl onto the pod.
+    5. Run `python -m yomi.train ...` over SSH, streaming stdout.
+    6. scp models/<run-name>/best/ back home.
+    7. Delete the pod.
 
 Cost confirmation: prints estimated $/hr and total before creating the pod;
 requires --yes to skip the interactive prompt. Pod is deleted on exit
 (success, error, or Ctrl-C — see the try/finally).
 
 Prerequisites:
-    - runpodctl installed (or RUNPOD_API_KEY set + uses HTTP API directly)
-    - SSH key registered at https://www.runpod.io/console/user/settings
-      (RunPod injects it into pods automatically when --startSSH is set)
-    - ~/yomi has data/heteronyms.json + data/train.jsonl + data/val.jsonl
+    - runpodctl installed
+    - RUNPOD_API_KEY in env (e.g. `export RUNPOD_API_KEY=$(cat ~/secrets/runpod/api_key.txt)`)
+    - SSH pubkey registered at https://www.runpod.io/console/user/settings
+      (RunPod injects it into pods on creation)
+    - data/heteronyms.json + data/train.jsonl + data/val.jsonl exist locally
 
 Usage:
     python scripts/run_training_pod.py                # interactive, defaults
     python scripts/run_training_pod.py --yes          # skip cost prompt
     python scripts/run_training_pod.py --gpu RTX3090 --epochs 3 \
-                                       --run-name v1 --max-cost 0.30
+                                       --run-name v1 --max-steps 20
 """
 
 from __future__ import annotations
@@ -113,20 +119,32 @@ def scp_from(host: str, port: int, src: str, dst: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def wait_for_ssh(pod_id: str, timeout: int = 600) -> tuple[str, int]:
-    """Poll pod status until SSH is ready. Returns (host, port)."""
+def wait_for_ssh(pod_id: str, timeout: int = 1200) -> tuple[str, int]:
+    """Poll pod status until SSH is reachable. Returns (host, port).
+
+    runpodctl reports SSH reachability via `info["ssh"]["ip"]/[port]` once
+    the host has been allocated, but the container itself only starts
+    after the image has been pulled (uptimeSeconds > 0). We need both:
+    SSH info present AND container running.
+    """
     deadline = time.time() + timeout
+    last_msg = ""
     while time.time() < deadline:
         info = runpodctl("pod", "get", pod_id)
-        # Different runpodctl versions surface SSH info differently — try a few.
         if isinstance(info, dict):
-            status = info.get("desiredStatus") or info.get("status") or ""
-            for port_info in info.get("runtime", {}).get("ports") or []:
-                if port_info.get("privatePort") == 22 and port_info.get("isIpPublic"):
-                    return port_info["ip"], port_info["publicPort"]
-            print(f"  pod status={status}, ssh not ready yet...", file=sys.stderr)
-        time.sleep(10)
-    sys.exit("timed out waiting for SSH; check `runpodctl pod get <id>` manually")
+            status = info.get("desiredStatus", "?")
+            uptime = info.get("uptimeSeconds", 0) or 0
+            ssh = info.get("ssh") or {}
+            ip = ssh.get("ip")
+            port = ssh.get("port")
+            msg = f"  status={status} uptime={uptime}s ssh={ip}:{port}"
+            if msg != last_msg:
+                print(msg, file=sys.stderr)
+                last_msg = msg
+            if ip and port and uptime > 0:
+                return ip, int(port)
+        time.sleep(15)
+    sys.exit(f"timed out after {timeout}s; check `runpodctl pod get {pod_id}` manually")
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,7 +164,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data")
     ap.add_argument("--out-dir", type=Path, default=REPO_ROOT / "models",
                     help="local dir to receive checkpoints")
-    ap.add_argument("--image", default="ghcr.io/hbar137/yomi-train:latest")
+    ap.add_argument("--template-id", default="runpod-torch-v240",
+                    help="RunPod template id; default uses cached pytorch 2.4")
+    ap.add_argument("--repo-url", default="https://github.com/hbar137/yomi.git",
+                    help="git repo cloned into /workspace/yomi on pod startup")
     ap.add_argument("--name", default=None,
                     help="pod name (default: yomi-train-<run-name>)")
     ap.add_argument("--keep-pod", action="store_true",
@@ -208,17 +229,16 @@ def main() -> None:
     create_args = [
         "pod", "create",
         "--name", pod_name,
-        "--image", args.image,
+        "--template-id", args.template_id,
         "--gpu-id", GPU_TYPES[args.gpu],
         "--gpu-count", "1",
         "--container-disk-in-gb", str(args.container_disk),
         "--volume-in-gb", str(args.volume_size),
         "--volume-mount-path", "/workspace",
         "--cloud-type", "COMMUNITY",
+        "--public-ip",   # community cloud: required for SSH to be reachable
         "--ssh",
         "--ports", "22/tcp",
-        # No --args / --entrypoint flag: image's ENTRYPOINT=sleep infinity
-        # keeps the pod idle so we can SSH in.
     ]
     pod = runpodctl(*create_args)
     pod_id = pod["id"] if isinstance(pod, dict) else None
@@ -263,15 +283,39 @@ def main() -> None:
         else:
             sys.exit("ssh not responding after 60s; abort")
 
+        print(f"\ncloning repo + installing training deps on pod...", file=sys.stderr)
+        setup_cmd = (
+            "set -e && "
+            "cd /workspace && "
+            f"if [ -d yomi/.git ]; then cd yomi && git pull --ff-only; "
+            f"else git clone {shlex.quote(args.repo_url)} yomi && cd yomi; fi && "
+            "pip install --quiet -e '.[train]' && "
+            "mkdir -p data models && "
+            "echo SETUP_DONE"
+        )
+        rc = ssh_exec(host, port, setup_cmd, stream=True)
+        if rc != 0:
+            print(f"\nsetup failed with rc={rc}", file=sys.stderr)
+            sys.exit(rc)
+
         print(f"\nstaging data...", file=sys.stderr)
-        ssh_exec(host, port, "mkdir -p /workspace/data /workspace/models")
         for fname in ("heteronyms.json", "train.jsonl", "val.jsonl"):
             src = args.data_dir / fname
             print(f"  scp {src.name} ({src.stat().st_size // (1024*1024)} MB)...",
                   file=sys.stderr)
-            scp_to(host, port, src, "/workspace/data/")
+            scp_to(host, port, src, "/workspace/yomi/data/")
 
-        train_cmd = build_training_args(args)
+        # Training command runs from /workspace/yomi so paths resolve to the
+        # repo's data/ + models/ subdirs.
+        train_args = build_training_args(args).replace(
+            "--data-dir /workspace/data", "--data-dir /workspace/yomi/data"
+        ).replace(
+            "--heteronyms /workspace/data/heteronyms.json",
+            "--heteronyms /workspace/yomi/data/heteronyms.json"
+        ).replace(
+            "--out-dir /workspace/models", "--out-dir /workspace/yomi/models"
+        )
+        train_cmd = f"cd /workspace/yomi && {train_args}"
         print(f"\nrunning training:\n  {train_cmd}\n", file=sys.stderr)
         rc = ssh_exec(host, port, train_cmd, stream=True)
         if rc != 0:
@@ -280,7 +324,7 @@ def main() -> None:
 
         print(f"\npulling checkpoint...", file=sys.stderr)
         scp_from(host, port,
-                 f"/workspace/models/{args.run_name}/best",
+                 f"/workspace/yomi/models/{args.run_name}/best",
                  args.out_dir / args.run_name / "best")
         print(f"  -> {args.out_dir / args.run_name / 'best'}", file=sys.stderr)
 
