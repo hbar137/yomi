@@ -55,7 +55,7 @@ services:
     volumes:
       - ${HOME}/secrets:/secrets:ro
     environment:
-      - TZ=America/Chicago
+      - TZ=America/Los_Angeles
     mem_limit: 8192m
     cpus: 6.0
     healthcheck:
